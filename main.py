@@ -1,4 +1,5 @@
-from SlabTransportSolver import Region, Model
+from SlabTransportSolver_QD import Region, Model
+# from SlabTransportSolver import Region, Model
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -13,25 +14,52 @@ def UniformInfiniteMedium():
     
     width = 5
     sigma_t = 10
-    sigma_s = 0
+    sigma_s = 8
     source  = 10
-    num_cells = 100
-    num_angs = 8
+    num_cells = 50
+    num_angs = 2
     
-    r = Region(width, sigma_t, sigma_s, source, "inf_medium", "reflecting", "reflecting")
+    r = Region(width, sigma_t, sigma_s, source, "inf_medium", "reflecting", "vacuum")
     r.applyMesh(num_cells, width/num_cells, num_angs)
     
-    model = Model(r)
+    model = Model(r)#, angfluxRBC=2.55)
     model.combineMesh()
-    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(LOUD=False)
+    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(itermethod="SI",LOUD=False)
     model.solution_UIM()
-    model.plotModel(show_AnalySol=False) # Shows current
+    # model.plotModel(show_AnalySol=False) # Shows current
     model.plotModel(show_AnalySol=True)  # Doesn't show current
-    model.plotOptics()
+    # model.plotOptics()
     
     return scatt_ratios, maxOptThicknesses, iterNum
 
 # UniformInfiniteMedium()
+
+def TwoRegionReflecting():
+    
+    width = 5
+    sigma_t = 10
+    sigma_s = 8
+    source  = 10
+    num_cells = 100
+    num_angs = 20
+    
+    r1 = Region(width, sigma_t, sigma_s, source, "1", "reflecting", "vacuum")
+    r2 = Region(width, sigma_t, sigma_s, 5, "2", "vacuum", "reflecting")
+    
+    r1.applyMesh(num_cells, width/num_cells, num_angs)
+    r2.applyMesh(num_cells, width/num_cells, num_angs)
+    
+    model = Model(r1,r2)
+    model.combineMesh()
+    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(itermethod="QD",LOUD=False)
+    model.solution_UIM()
+    model.plotModel(show_AnalySol=False) # Shows current
+    # model.plotModel(show_AnalySol=True)  # Doesn't show current
+    # model.plotOptics()
+    
+    return
+
+# TwoRegionReflecting()
 
 def SrcFreePureAbsorber():
     
@@ -47,11 +75,11 @@ def SrcFreePureAbsorber():
     
     model = Model(r, angfluxLBC=10, angfluxRBC=0)
     model.combineMesh()
-    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(LOUD=False)
+    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(itermethod="SI",LOUD=False)
     model.solution_SFPA()
-    model.plotModel(show_AnalySol=False) # Shows current
+    # model.plotModel(show_AnalySol=False) # Shows current
     model.plotModel(show_AnalySol=True)  # Doesn't show current
-    model.plotOptics()
+    # model.plotOptics()
     
     return scatt_ratios, maxOptThicknesses, iterNum
 
@@ -59,8 +87,8 @@ def SrcFreePureAbsorber():
 
 def SrcFreeHalfSpace():
     
-    num_cells = 500
-    angdeg = 4
+    num_cells = 1000
+    angdeg = 40
     
     r1 = Region(8, 1, 0.9, 0, "half1", "vacuum", "vacuum")
     r2 = Region(12, 3, 1.5, 0, "half2", "vacuum", "vacuum")
@@ -70,9 +98,9 @@ def SrcFreeHalfSpace():
     
     model = Model(r1,r2, angfluxLBC=10, angfluxRBC=8)
     model.combineMesh()
-    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(LOUD=False)
-    model.plotModel(show_AnalySol=False)
-    model.plotOptics()
+    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(itermethod="QD",LOUD=False)
+    # model.plotModel(show_AnalySol=False)
+    # model.plotOptics()
     
     # Compare to excel sheet
     
@@ -170,7 +198,7 @@ def SrcFreeHalfSpace():
     
     return scatt_ratios, maxOptThicknesses, iterNum
 
-SrcFreeHalfSpace()
+# SrcFreeHalfSpace()
 
 def Problem1(num_cells):
     
@@ -179,7 +207,7 @@ def Problem1(num_cells):
     
     model = Model(r1, angfluxLBC=np.array([0,10]), angfluxRBC=0)
     model.combineMesh()
-    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(LOUD=False)
+    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(itermethod="QD", LOUD=False)
     model.plotModel()
     model.plotOptics()
     
@@ -224,13 +252,13 @@ def ReedsProblemUniform():
     
     r1_width, r1_sigma = 2, 1
     r2_width, r2_sigma = 2, 1
-    r3_width, r3_sigma = 1, 0
+    r3_width, r3_sigma = 1, 0.001
     r4_width, r4_sigma = 1, 5
     r5_width, r5_sigma = 2, 50
     tot_width = 8
     
-    num_cells = 1000
-    angdeg = 400
+    num_cells = 2000
+    angdeg = 40
     
     r1 = Region(r1_width,r1_sigma,0.9,0,"ScatNoSrc","vacuum","vacuum")
     r2 = Region(r2_width,r2_sigma,0.9,1,"ScatWSrc", "vacuum","vacuum")
@@ -246,13 +274,13 @@ def ReedsProblemUniform():
     
     model = Model(r1,r2,r3,r4,r5, angfluxLBC=0, angfluxRBC=0)
     model.combineMesh()
-    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(LOUD=False)
+    _, _, _, scatt_ratios, maxOptThicknesses, iterNum = model.doDiamondDiffV3(itermethod="QD",LOUD=False)
     model.plotModel()
-    model.plotOptics()
+    # model.plotOptics()
     
     return scatt_ratios, maxOptThicknesses, iterNum
 
-# ReedsProblemUniform()
+ReedsProblemUniform()
 
 def plotIterationVsScatteringRatio() -> None:
     """ Plots Iteration number vs. Scattering Ratio
