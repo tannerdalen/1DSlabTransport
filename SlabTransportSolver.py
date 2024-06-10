@@ -1,34 +1,21 @@
 ### Tanner Heatherly
 ### NSE 654 - Computational Particle Transport
-### May 10th, 2024
-### Homework #3
+### June 13th, 2024
+### Final Project
  #
 ### Descritization method: Diamond Difference
  #
-### Code requirements:
-###     - Heterogenetic cross sections (sigma, sigma_s)
-###     - Customizable boundary conditions (iso/anisotropic angular flux, reflecting)
-###     - Allow for unique mesh cell sizes
- #
-### There are several deliverables for this assignment, including:
-###     - Demonstrate correct solution for Uniform Infinite Medium
-###     - Demonstrate correct solution for Source-free pure absorber
-###     - Demonstrate correct solution for Source-free half-space
-###     - Record Source Iteration rate of convergence as a function
-###       of max scattering ratio, max optical thickness, and BCs.
-###     - Solve custom Problem #1
-###     - Solve Reed's Problem
-###
-###           Prepare SCALAR FLUX and CURRENT for all problems!
-###
+### Final Project addition: Quasi-Diffusion
 
 from dataclasses import dataclass, field
 from typing import Any
+from collections import Counter
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
 
 BOUNDARY_CONDITIONS = ["vacuum", "reflecting", None]
+ITERATION_METHODS = ["SI","QD"]
 
 ##########################################
 
@@ -69,27 +56,12 @@ class Mesh:
         else:
             self.cell_widths = cell_widths
         
-        # Initialize the angular flux array. This will remain zeros until transport is performed.
-        # Top down (first idx) is spatial elements, left to right (second idx) is angular.
-        # For example if self.cells = array([[1,2,3], then self.angflux[1,2] == 6 
-        #                                    [4,5,6],
-        #                                    [7,8,9]) 
-        
-        self.angfluxes = np.zeros([self.cellbins, self.angbins])
-        self.scalarfluxes = np.zeros([self.cellbins])
-        self.netCurrent = np.zeros([self.cellbins])
-        self.analyticalsol = np.zeros([self.cellbins])
-        
-        # Create separate arrays for left edge and right edge of a given cell
-        
-        self.angfluxes_left_edge = np.zeros([self.cellbins, self.angbins])
-        self.angfluxes_right_edge = np.zeros([self.cellbins, self.angbins])
+        # Create separate array for edges of a given cell
+        self.scalarfluxes_edges = np.zeros([self.cellbins+1])
+        self.angfluxes_edges = np.zeros([self.cellbins+1, self.angbins])
         
         # Create mus and wgts for desired degree
-        # Note: only taking the positive values!
         self.mus, self.wgts = np.polynomial.legendre.leggauss(angdegree)
-        self.mus = np.array([mu for mu in self.mus if mu>0])
-        self.wgts = self.wgts[0:len(self.mus)]
         
         # Create cell bin center and edge locations
         self.xEdgelocs_left = []
@@ -108,12 +80,21 @@ class Mesh:
                 
                 # Cell widths are not guarenteed to be uniform, so this assigns centers accordingly
                 self.xCenters.append(round(self.xCenters[i-1] + (self.cell_widths[i]/2 + self.cell_widths[i-1]/2), 10))
-            
+        
+        self.xEdgelocs = np.append(self.xEdgelocs_left, [self.xEdgelocs_right[-1]], axis=0)
+        
         # Checks
         if not len(list(self.cell_widths)) == self.cellbins:
             raise TransportError("Number of cell widths must equal number of cells")
             
         return
+    
+    def getPositiveOrdinates(self) -> (np.array, np.array):
+        """ Gets only the positive mus and their corresponding weights """
+        mus = np.array([mu for mu in self.mus if mu>0])
+        wgts = self.wgts[0:len(self.mus)][::-1]
+        
+        return mus, wgts
 
 @dataclass
 class Region:
@@ -188,10 +169,24 @@ class Model:
         
         return
     
-    def _convertBC(self, BC, angbins) -> np.array:
+    def getMaterialProperties(self, x: float) -> tuple:
+        """ 
+        Gets material properties of some region 
+        at location 'x' 
+            
+        Args:
+            x - location within model
+        Returns:
+            sigma_s, sigma_t, source at location 'x' 
+        """
+        for r in self.regions:
+            if r.ALB <= x <= r.ARB:  
+                return r.sigma_s, r.sigma, r.source
+    
+    def _convertBC(self, BC: float) -> np.array:
         """ Converts non-array boundary condition (BC) to np.array. 
             Assumes all incident flux[m] == BC. """
-        return np.array([BC]*angbins)
+        return np.array([BC]*self.mesh.angbins)
     
     def combineMesh(self) -> None:
         """ Combines each Region Mesh into
@@ -204,256 +199,361 @@ class Model:
                                      str([r.mesh.angdegree for r in self.regions]))
         
         cellbins_tot = sum(r.mesh.cellbins for r in self.regions)
-        cell_widths_tot = list(itertools.chain(*[r.mesh.cell_widths for r in self.regions]))
+        cell_widths_tot = list(itertools.chain(*[r.mesh.cell_widths for r in self.regions])) # [1,2],[3],[4,5,6] -> [1,2,3,4,5,6]
         
         self.mesh = Mesh(cellbins_tot, cell_widths_tot, self.regions[0].mesh.angdegree)
         
         # Change BCs to match mesh angular shape if necessary
         if not isinstance(self.angfluxLBC, np.ndarray):
-            self.angfluxLBC = self._convertBC(self.angfluxLBC, self.mesh.angbins)
+            self.angfluxLBC = self._convertBC(self.angfluxLBC)
         if not isinstance(self.angfluxRBC, np.ndarray):
-            self.angfluxRBC = self._convertBC(self.angfluxRBC, self.mesh.angbins)
+            self.angfluxRBC = self._convertBC(self.angfluxRBC)
         
         return
     
-    def _convertAng2Scal(self, ang_centers_array: np.array) -> np.array:
-        """ Convert angular to scalar flux """
+    def _convertAng2Scal(self, angfluxes: np.array) -> np.array:
+        """ Convert angular to scalar flux. Only accurate if
+            angfluxes is increasing in angle from -1 to 1 for
+            each spatial element """
         
         phis = []
-        for i in range(len(ang_centers_array)):
-            phi = sum(self.mesh.wgts[m]*ang_centers_array[i][m] for m in range(self.mesh.angbins))
-            phis.append(phi)
+        for i in range(len(angfluxes)):
+            try:
+                phi = sum(self.mesh.wgts[m]*angfluxes[i][m] for m in range(len(self.mesh.wgts)))
+                phis.append(phi)
+            except IndexError:
+                raise TransportError("Too few angular flux directions. Did you combine directions?")
             
         return np.array(phis)
     
     def _convertEdge2Center(self, left_edge_array: iter, right_edge_array: iter) -> np.array:
-        """ Convert angular flux at edges to angular flux in center bins.
+        """ Convert flux at edges to flux in center bins.
             This is the definition of Diamond Difference. """
         
-        return np.array([1/2*(left_edge_array[i] + right_edge_array[i]) for i in range(len(self.mesh.angfluxes))])
+        return np.array([1/2*(left_edge_array[i] + right_edge_array[i]) for i in range(len(left_edge_array))])
     
-    def _convertAng2NetCurrent(self, rightward_ang_centers: np.array, leftward_ang_centers: np.array) -> np.array:
-        """ Converts partial angular flux to net current.
-            These are messy but honestly it's just funny
-            to leave them as nested list comprehensions."""
+    def _convertAng2NetCurrent(self, angfluxes_combined_edges: np.array) -> np.array:
+        """ Converts angular flux to net current. """
         
-        partial_rightward = np.array([sum(self.mesh.mus[m]*self.mesh.wgts[m]*rightward_ang_centers[i][m] for m in range(self.mesh.angbins)) \
-                                 for i in range(len(rightward_ang_centers))])
-        partial_leftward = np.array([sum(-self.mesh.mus[m]*self.mesh.wgts[m]*leftward_ang_centers[i][m] for m in range(self.mesh.angbins)) \
-                                 for i in range(len(leftward_ang_centers))])
-        
-        return partial_rightward + partial_leftward
+        return np.array([sum(self.mesh.mus[m]*self.mesh.wgts[m]*angfluxes_combined_edges[i][m]
+                         for m in range(len(self.mesh.mus))) \
+                         for i in range(len(angfluxes_combined_edges))])
     
-    def doDiamondDiffV3(self, eps=1e-9, LOUD=False) -> tuple():
-        """ 9:03pm, May 9th. I am not happy with my code, even
-            after two weeks of working on it.
+    def _combineAngularFlux(self, leftward: np.array, rightward: np.array) -> np.array:
+        """ Combine fluxes together. NOTE that the mu values for
+            both arrays are increasing in MAGNITUDE, so to account
+            for the negative mus in the leftward flux, the arrays
+            are combined such that the leftward mus (columns) are
+            flipped for each spatial element "i":
             
-            5:42am, May 10th. I have done my best. May
-            judgement be swift.
-            
-            1:05pm, May 10th. I found the bug. The code
-            works. My spirits are high with hopes my grade
-            is higher!
-            
-            Args:
-                eps - Allowable error between iterations
-                LOUD - Enable/disable print statements for debugging
-                
-            Returns:
-                Scalar fluxes, Angular fluxes, net current, scattering ratios, max optical thicknesses, iteration number """
+                 left    right    combined
+              i1 [1 2] + [5 6] -> [2 1 5 6]
+              i2 [3 4]   [7 8]    [4 3 7 8] """
+              
+        return np.hstack((np.fliplr(leftward),rightward))
+    
+    def _sourceIteration(self, phis_latest: np.array) -> np.array:
+        """ Determines the new phis based on the old phis
+            using source iteration. Unsurprisely redundant! """
+        return phis_latest
+    
+    def _quasiDiffusion(self, angfluxes_combined_edges: np.array) -> np.array:
+        """ Determines the new phis using Quasi-Diffusion (QD).
+            See 'The Quasi-Diffusion Method for Solving Transport
+            Problems in Planar and Spherical Geometry' by Miften
+            and Larson.
+            """
+        
+        def Bfactor(angfluxes_i: np.array) -> float:
+            """ Boundary Eddington factor. Angular fluxes should
+                encapsulate both left and rightward directions
+                (in that order) of a single spatial cell 'i'. """
+            top = sum([abs(self.mesh.mus[m])*angfluxes_i[m]*self.mesh.wgts[m] for m in range(len(self.mesh.wgts))])
+            bottom = sum([angfluxes_i[m]*self.mesh.wgts[m] for m in range(len(self.mesh.wgts))])
+            return top/bottom
+        
+        def Efactor(angfluxes_i: np.array) -> float:
+            """ Intermediary (normal) Eddington factor. Angular 
+                fluxes should encapsulate both left and 
+                rightward directions (in that order) of a single
+                spatial cell 'i'."""
+            top = sum([(self.mesh.mus[m]**2)*angfluxes_i[m]*self.mesh.wgts[m] for m in range(len(self.mesh.wgts))])
+            bottom = sum([angfluxes_i[m]*self.mesh.wgts[m] for m in range(len(self.mesh.wgts))])
+            return top/bottom
         
         # Initialize arrays
-        phis_old = self.mesh.scalarfluxes
-        angfluxes_rightward = np.zeros_like(self.mesh.angfluxes)
-        angfluxes_leftward = np.zeros_like(self.mesh.angfluxes)
-        angfluxes_left_edge = np.zeros_like(self.mesh.angfluxes)
-        angfluxes_right_edge = np.zeros_like(self.mesh.angfluxes) 
-        self.scatt_ratios = np.zeros_like(self.mesh.scalarfluxes)
-        self.maxOptThicknesses = np.zeros_like(self.mesh.scalarfluxes)
+        A = np.zeros((len(angfluxes_combined_edges),len(angfluxes_combined_edges)))
+        b = np.zeros(len(angfluxes_combined_edges))
         
-        mus = self.mesh.mus
-        wgts = self.mesh.wgts
+        # This is for visualization only...
+        A_eddingtons = np.zeros([len(angfluxes_combined_edges),3])
         
-        # Prepare for convergence loop
-        isConverged = False
+        ### Setup matrix...
+        
+        ### Leftmost boundary...    
+        sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[0])
+        sigma_a = sigma - sigma_s
+        dx = self.mesh.cell_widths[0]
+        
+        # "E_12" or E_32" represents "E_1/2" and "E_3/2"
+        E_12 = Efactor(angfluxes_combined_edges[0])
+        E_32 = Efactor(angfluxes_combined_edges[1])
+        B_12 = Bfactor(angfluxes_combined_edges[0])
+        # E_12 = 1/3
+        # E_32 = 1/3
+        # B_12 = 1/2
+        
+        if self.regions[0].LBC == "reflecting":
+            A[0][0] = E_12/(sigma*dx) + sigma_a*dx/2 # phi_1/2
+            A[0][1] = -E_32/(sigma*dx) # phi_3/2
+            b[0] = source*dx/2
+            
+        elif self.regions[0].LBC == "vacuum":
+            A[0][0] = B_12 + E_12/(sigma*dx) + sigma_a*dx/2 # phi_1/2
+            A[0][1] = -E_32/(sigma*dx) # phi_3/2
+            b[0] = source*dx/2 + 2*sum([self.mesh.mus[m]*angfluxes_combined_edges[0][m]*self.mesh.wgts[m] \
+                                        for m in range((len(self.mesh.mus))) if self.mesh.mus[m] > 0])
+    
+        A_eddingtons[0][0] = E_12
+        A_eddingtons[0][1] = E_32
+        A_eddingtons[0][2] = 0
+        
+        ### Rightmost boundary...   
+        sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[-1])
+        sigma_a = sigma - sigma_s
+        dx = self.mesh.cell_widths[-1]
+        
+        E_Jminhalf = Efactor(angfluxes_combined_edges[-2])
+        E_Jplushalf = Efactor(angfluxes_combined_edges[-1])
+        B_Jplushalf = Bfactor(angfluxes_combined_edges[-1])
+        # E_Jminhalf = 1/3
+        # E_Jplushalf = 1/3
+        # B_Jplushalf = 1/2
+        
+        if self.regions[-1].RBC == "reflecting":
+            A[-1][-2] = -E_Jminhalf/(sigma*dx) # phi_J-1/2
+            A[-1][-1] = E_Jplushalf/(sigma*dx) + sigma_a*dx/2 # phi_J+1/2
+            b[-1] = source*dx/2
+            
+        elif self.regions[-1].RBC == "vacuum":
+            A[-1][-2] = -E_Jminhalf/(sigma*dx) # phi_J-1/2
+            A[-1][-1] = B_Jplushalf + E_Jplushalf/(sigma*dx) + sigma_a*dx/2 
+            b[-1] = source*dx/2 + 2*sum([abs(self.mesh.mus[m])*angfluxes_combined_edges[-1][m]*self.mesh.wgts[m] \
+                                         for m in range(len(self.mesh.mus)) if self.mesh.mus[m] < 0])
+        
+        A_eddingtons[-1][-3] = 0
+        A_eddingtons[-1][-2] = E_Jminhalf
+        A_eddingtons[-1][-1] = E_Jplushalf
+        
+        ### Everything else in between...
+        for i in range(1,len(angfluxes_combined_edges)-1):
+            
+            # jth cell properties
+            sigma_si, sigma_i, source_i = self.getMaterialProperties(self.mesh.xCenters[i-1])
+            sigma_ai = sigma_i - sigma_si
+            dx_i = self.mesh.cell_widths[i-1]
+            
+            # jth + 1 cell properties
+            sigma_siplus, sigma_iplus, source_iplus = self.getMaterialProperties(self.mesh.xCenters[i])
+            sigma_aiplus = sigma_iplus - sigma_siplus
+            dx_iplus = self.mesh.cell_widths[i]
+            
+            E_Jminhalf = Efactor(angfluxes_combined_edges[i-1])
+            E_Jplushalf = Efactor(angfluxes_combined_edges[i])
+            E_Jplusthreehalf = Efactor(angfluxes_combined_edges[i+1])
+            # E_Jminhalf = 1/3
+            # E_Jplushalf = 1/3
+            # E_Jplusthreehalf = 1/3
+            
+            A[i][i-1] = -E_Jminhalf/(sigma_i*dx_i)
+            A[i][i+1] = -E_Jplusthreehalf/(sigma_iplus*dx_iplus)
+            A[i][i] = E_Jplushalf/(sigma_iplus*dx_iplus) + E_Jplushalf/(sigma_i*dx_i) + (sigma_ai*dx_i + sigma_aiplus*dx_iplus)/2
+            b[i] = (source_i*dx_i + source_iplus*dx_iplus)/2
+            
+            A_eddingtons[i][-1] = E_Jminhalf
+            A_eddingtons[i][1] = E_Jplusthreehalf
+            A_eddingtons[i][0] = E_Jplushalf
+                
+        # print(f"{A=} \n{b=}")
+        # print(f"{A_eddingtons = }")
+        # print(f"{B_12 = }, {B_Jplushalf = }")
+        
+        # Solve the matrix
+        phi_new_edges = np.linalg.solve(A,b)
+                
+        # Checks
+        if np.any(phi_new_edges < 0):
+            raise TransportError("Negative flux occurred during QD iteration")
+        if np.any(np.isnan(phi_new_edges)):
+            raise TransportError("NaN values appeared during QD iteration. Is there a vacuum region?")
+        
+        return phi_new_edges
+    
+    def doDiamondDiffV4(self, eps=1e-6, itermax=10_000, itermethod="SI", LOUD=False) -> np.array:
+        """ 
+        Args:
+            eps - Allowable error between iterations
+            itermax - maximum allowable iterations 
+            itermethod - Iteration method used to determine
+                         scalar flux for the next iteration
+            LOUD - Enable/disable print statements for debugging
+            
+        Returns:
+            scalar fluxes at the edges
+        """
+        
+        # Checks
+        if not itermethod in ITERATION_METHODS:
+            raise TransportError(f"Unknown itermethod '{itermethod}'")
+        
+        # Initialize arrays
+        phi_old_edges = np.zeros_like(self.mesh.scalarfluxes_edges)
+        phi_new_edges = np.zeros_like(self.mesh.scalarfluxes_edges)
+        angfluxes_leftward_edges = np.zeros_like(self.mesh.angfluxes_edges)
+        angfluxes_rightward_edges = np.zeros_like(self.mesh.angfluxes_edges)
+        
+        # Grab only the positive mus
+        mus, _ = self.mesh.getPositiveOrdinates()
+        
+        # Set convergence properties
         iterNum = 1
+        max_diff = np.inf
+        max_diffs = []
+        all_diffs = []
+        isConverged = False
         
-        # Start convergence loop...
-        while not isConverged:    
+        # Begin loop
+        while not isConverged:
             
-            # Set left boundary flux
+            print(f"Iteration {iterNum}...")
+            
+            if iterNum+1 == itermax:
+                
+                plt.plot([x for x in range(2,iterNum)], max_diffs[1:])
+                plt.xlabel("Iteration Number")
+                plt.ylabel("Max Difference between Iterations")
+                plt.yscale("log")
+                plt.show()
+                
+                plt.plot(self.mesh.xEdgelocs, all_diffs[-1])
+                plt.xlabel("x (cm)")
+                plt.ylabel("Differences at last Iteration")
+                plt.yscale("log")
+                plt.show()
+                
+                self.scalarfluxes_edges = phi_new_edges
+                self.plotModel()
+                
+                raise TransportError(f"Could not converge within {itermax} iterations. "+
+                                     f"Last maximum difference = {max_diff}. "+
+                                     "Attempted to plot latest scalar flux...")
+                
+            ### Sweep left --> right, starting with boundary conditions...
             if self.regions[0].LBC == "reflecting":
-                angfluxes_left_edge[0] = angfluxes_leftward[0][::-1]
-            else:
-                angfluxes_left_edge[0] = self.angfluxLBC
+                angfluxes_rightward_edges[0] = angfluxes_leftward_edges[0]
+            if self.regions[0].LBC == "vacuum":
+                angfluxes_rightward_edges[0] = self.angfluxLBC
                 
-            if LOUD: print(f"Initial left psi_inc = {angfluxes_left_edge[0]}")
+            ### Begin the rightward sweep...
+            for i in range(1,len(angfluxes_rightward_edges)):
                 
-            # Sweep from left --> right
-            for i in range(len(angfluxes_rightward)):
+                # Get model properties
+                sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[i-1])
+                dx = self.mesh.cell_widths[i-1]
                 
-                # Region properties
-                for r in self.regions:
-                    if r.ALB <= self.mesh.xCenters[i] <= r.ARB:
-                        sigma_si = r.sigma_s
-                        sigma_i  = r.sigma
-                        source_i = r.source
-                        
-                        # Get scattering ratio during rightward sweep
-                        try:
-                            scatt_ratio = sigma_si/sigma_i
-                        except ZeroDivisionError: # i.e., vacuum region
-                            scatt_ratio = 0
-                        
-                # Organize cell properties
-                dx = self.mesh.cell_widths[i]
-                self.scatt_ratios[i] = scatt_ratio
-                self.maxOptThicknesses[i] = sigma_i*dx/mus[0]
-                
-                # if LOUD: print(f"cell     = {i}\n"
-                #                f"{sigma_i  = }\n"+
-                #                f"{sigma_si = }\n"+
-                #                f"{source_i = }\n"+
-                #                f"{dx       = }\n"+
-                #                f"{self.mesh.xCenters[i] = }\n")
-                
-                # Iterate over angle
-                for m in range(self.mesh.angbins):
-                    angfluxes_right_edge[i][m] = (source_i/2 + 
-                                                  sigma_si*phis_old[i]/2 + 
-                                                  mus[m]/dx*angfluxes_left_edge[i][m] -
-                                                  sigma_i/2*angfluxes_left_edge[i][m]) / \
-                                                  (mus[m]/dx + sigma_i/2)
-                    # Set edges
-                    if not i+1 == len(self.mesh.angfluxes):
-                        angfluxes_left_edge[i+1][m] = angfluxes_right_edge[i][m]
-                        
-                if LOUD: print(f"angfluxes_left_edge[{i}] = {angfluxes_left_edge[i]}")
-            
-            # Convert edges back to centers and append
-            angfluxes_rightward = self._convertEdge2Center(angfluxes_left_edge, angfluxes_right_edge)
-            
-            if LOUD: 
-                print("left edges --- right edges")
-                for l,r in zip(angfluxes_left_edge, angfluxes_right_edge):
-                    print(" ",l," ", r)
-            
-            # Clear edge fluxes
-            angfluxes_left_edge = np.zeros_like(self.mesh.angfluxes)
-            angfluxes_right_edge = np.zeros_like(self.mesh.angfluxes)
-            
-            # Set right boundary flux
+                for m in range(len(mus)):
+                    
+                    angfluxes_rightward_edges[i][m] = (sigma_s/4*(phi_old_edges[i]+phi_old_edges[i-1]) + 
+                                                       source/2 - 
+                                                       angfluxes_rightward_edges[i-1][m]*(-mus[m]/dx + sigma/2)) / \
+                                                       (mus[m]/dx + sigma/2)
+                                                       
+            ### Sweep right --> left, starting with boundary conditions...
             if self.regions[-1].RBC == "reflecting":
-                angfluxes_right_edge[-1] = angfluxes_rightward[-1][::-1]
-            else:
-                angfluxes_right_edge[-1] = self.angfluxRBC
+                angfluxes_leftward_edges[-1] = angfluxes_rightward_edges[-1]
+            if self.regions[-1].RBC == "vacuum":
+                angfluxes_leftward_edges[-1] = self.angfluxRBC
                 
-            if LOUD: print(f"Initial right psi_inc = {angfluxes_right_edge[-1]}")
-            
-            # Sweep from right --> left
-            for i in range(len(angfluxes_leftward)-1, -1 ,-1):
+            ### Begin the leftward sweep...
+            for i in range(len(angfluxes_leftward_edges) - 2, -1, -1):
                 
-                # Region properties
-                for r in self.regions:
-                    if r.ALB < self.mesh.xCenters[i] < r.ARB:
-                        sigma_si = r.sigma_s
-                        sigma_i  = r.sigma
-                        source_i = r.source
-                        
-                # Organize cell properties
+                # Get model properties
+                sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[i])
                 dx = self.mesh.cell_widths[i]
                 
-                # Iterate over angle
-                for m in range(self.mesh.angbins):
-                    angfluxes_left_edge[i][m] = (angfluxes_right_edge[i][m]*(-mus[m]/dx + sigma_i/2) -
-                                                 source_i/2 - sigma_si*phis_old[i]/2) / (-mus[m]/dx - sigma_i/2)
-                    # Set edges
-                    if i != 0 != len(self.mesh.angfluxes):
-                        angfluxes_right_edge[i-1][m] = angfluxes_left_edge[i][m]
+                for m in range(len(mus)):
+                    
+                    angfluxes_leftward_edges[i][m] = (sigma_s/4*(phi_old_edges[i]+phi_old_edges[i+1]) + 
+                                                      source/2 -
+                                                      angfluxes_leftward_edges[i+1][m]*(-mus[m]/dx + sigma/2)) / \
+                                                      (mus[m]/dx + sigma/2)
+                                                      
+            # Combine fluxes together. NOTE that the mu values for
+            # both arrays are increasing in MAGNITUDE, so to account
+            # for the negative mus in the leftward flux, the arrays
+            # are combined such that the leftward mus (columns) are
+            # flipped for each spatial element "i":
+            #
+            #     left    right    combined
+            #  i1 [1 2] + [5 6] -> [2 1 5 6]
+            #  i2 [3 4]   [7 8]    [4 3 7 8]
+            angfluxes_combined_edges = self._combineAngularFlux(angfluxes_leftward_edges, angfluxes_rightward_edges)
+            
+            # Calculate scalar flux for the next iteration
+            if itermethod == "SI":
+                phi_new_edges = self._sourceIteration(self._convertAng2Scal(angfluxes_combined_edges))
+            elif itermethod == "QD":
+                phi_new_edges = self._quasiDiffusion(angfluxes_combined_edges)
+            
+            # Check if maximum difference between iterations is within
+            # convergence criteria
+            diff = np.abs(phi_new_edges - phi_old_edges)
+            all_diffs.append(diff)
+            max_diff = np.max(diff)
+            max_diffs.append(max_diff)
+            
+            if max_diff <= eps:
                 
-                if LOUD: print(f"angfluxes_right_edge[{i}] = {angfluxes_right_edge[i]}")
-                
-            if LOUD: 
-                print("left edges --- right edges")
-                for l,r in zip(angfluxes_left_edge, angfluxes_right_edge):
-                    print(" ",l," ", r)
-            
-            # Convert edges back to centers and append
-            angfluxes_leftward = self._convertEdge2Center(angfluxes_left_edge, angfluxes_right_edge)
-            
-            # Add fluxes together
-            self.mesh.angfluxes = angfluxes_leftward + angfluxes_rightward
-            
-            # Convert to scalar flux
-            phis_new = self._convertAng2Scal(self.mesh.angfluxes)
-            
-            # if LOUD: print(f"{phis_new = }")
-            
-            # Check convergence. If converged, sigh in relief. If not, cope.
-            if np.all(np.abs(phis_new - phis_old)) < eps:
-                
-                # Converged!
                 isConverged = True
-                self.mesh.scalarfluxes = np.round(phis_new, decimals=5) # Avoid graphical errors
-                self.mesh.netCurrent = np.round(self._convertAng2NetCurrent(angfluxes_rightward, angfluxes_leftward), decimals=5)
-                print(f"Finished in {iterNum} iterations.")
-                break
+                print(f"-=- Converged in {iterNum} iterations -=-")
                 
-            else:
-                # Not converged...
-                phis_old = phis_new.copy()
-                iterNum +=1
-                
-        return self.mesh.scalarfluxes, self.mesh.angfluxes, self.mesh.netCurrent, self.scatt_ratios, self.maxOptThicknesses, iterNum
+                self.scalarfluxes_edges = phi_new_edges
+                self.netCurrent_edges = self._convertAng2NetCurrent(angfluxes_combined_edges)
             
+            else:
+                
+                iterNum +=1
+                if itermethod == "SI":
+                    phi_old_edges = self._sourceIteration(phi_new_edges)
+                elif itermethod == "QD":
+                    phi_old_edges = self._quasiDiffusion(angfluxes_combined_edges)
+                    
+        return phi_new_edges
     
     def solution_UIM(self) -> np.array:
-        """ Calculates uniform infinite medium solution """
+        """ Calculates uniform infinite medium solution 
+            for all edges """
         
-        self.analytical_solution = []
-        
-        for _ in self.mesh.angfluxes:
-            
-            # Region properties
-            sigma_si = self.regions[0].sigma_s
-            sigma_i  = self.regions[0].sigma
-            source_i = self.regions[0].source
-                    
-            self.analytical_solution.append(source_i/(sigma_i - sigma_si))
-        
-        return np.array(self.analytical_solution)
+        r = self.regions[0]
+        self.analytical_solution = np.array([r.source/(r.sigma-r.sigma_s)]*len(self.mesh.cell_widths))
+        return self.analytical_solution
     
     def solution_SFPA(self) -> np.array:
-        """ Calculates the source-free pure absorber solution """
+        """ Calculates the source-free pure absorber
+            soolution for all edges """
         
-        self.analytical_solution = np.zeros_like(self.mesh.angfluxes)
+        self.analytical_solution = np.zeros_like(self.mesh.angfluxes_edges)
         
-        # Create first solution that is only dx/2 away from left border
-        self.analytical_solution[0] = self.angfluxLBC * [np.exp(-self.regions[0].sigma*self.mesh.cell_widths[0]/(2*abs(self.mesh.mus[m]))) \
-                                                         for m in range(self.mesh.angbins)]
+        # Set leftmost incident flux
+        self.analytical_solution[0] = np.append(np.zeros_like(self.angfluxLBC), self.angfluxLBC, axis=0)
         
-        for i in range(1, len(self.analytical_solution)):
+        for i in range(1,len(self.mesh.angfluxes_edges)):
             
-            # Region properties
-            for r in self.regions:
-                # print(r.ALB, self.mesh.xEdgelocs[prev], r.ARB)
-                if r.ALB <= self.mesh.xCenters[i] <= r.ARB:
-                    sigma_si = r.sigma_s
-                    sigma_i  = r.sigma
-                    source_i = r.source
-                    
-            # Organize cell properties
-            mus = self.mesh.mus
-            wgts = self.mesh.wgts
-            dx = self.mesh.cell_widths[i]
+            _, sigma, _ = self.getMaterialProperties(self.mesh.xCenters[i-1])
+            dx = self.mesh.cell_widths[i-1]
             
-            # Get analytical angular fluxes at boundaries
-            for m in range(self.mesh.angbins):
-                optThickness = sigma_i*dx/abs(mus[m])
-                self.analytical_solution[i][m] = self.analytical_solution[i-1][m]*np.exp(-optThickness)
-            
-        # Convert angular flux to scalar flux
-        self.analytical_solution = self._convertAng2Scal(self.analytical_solution)
+            for m in range(len(self.mesh.mus)):
+                self.analytical_solution[i][m] = self.analytical_solution[i-1][m]*np.exp(sigma*dx/abs(self.mesh.mus[m]))
             
         return self.analytical_solution
     
@@ -495,7 +595,14 @@ class Model:
         for x in self.mesh.xEdgelocs_right:
             ax1.axvline(x=x, color="black", linestyle="dotted", alpha=0.1)
         
-        plt.plot(self.mesh.xCenters, self.maxOptThicknesses)
+        # Get the max optical thicknesses of each cell
+        maxOptThicknesses = np.zeros_like(self.mesh.xCenters)
+        for i, x in enumerate(self.mesh.xCenters):
+            _, sigma, _ = self.getMaterialProperties(x)
+            dx = self.mesh.cell_widths[i]
+            maxOptThicknesses[i] = sigma*dx/min(np.abs(self.mesh.mus))
+        
+        plt.plot(self.mesh.xCenters, maxOptThicknesses)
         plt.xlabel("x (cm)")
         plt.ylabel("Max Optical Thickness")
         
@@ -503,11 +610,11 @@ class Model:
         
         return
     
-    def plotModel(self, show_AnalySol=False, sol_x=[], sol_y=[]) -> None:
+    def plotModel(self, show_NumericalSol=True, show_current=False, show_AnalySol=False, sol_x=[], sol_y=[]) -> None:
         """ Plots Regions, Numerical, and (optional) analytical solutions """
         
         fig, ax1 = plt.subplots()
-        plt.grid(False)
+        lines = []
         
         for region in self.regions:
             
@@ -537,55 +644,58 @@ class Model:
             elif region.sigma > region.sigma_s: # Absorber dominant
                 color = colormap(region.sigma/color_tot)
             ax1.axvspan(region.ALB, region.ARB, color=color, alpha=0.25)
-            
-        line1, = ax1.plot(self.mesh.xCenters, list(self.mesh.scalarfluxes), label="Scalar Flux")
-        
-        ax1.set_ylabel("ϕ (particle per $cm^2$-sec)")
-        ax1.set_xlabel("x (cm)")
         
         # plot "grid lines" for each cell boundary in mesh
         for x in self.mesh.xEdgelocs_right:
             ax1.axvline(x=x, color="black", linestyle="dotted", alpha=0.1)
+            
+        # Plot numerical solution
+        if show_NumericalSol:
+            line, = ax1.plot(self.mesh.xEdgelocs, np.round(self.scalarfluxes_edges, decimals=5), label="Scalar Flux (Numerical)")
+            ax1.set_ylabel("ϕ (particle per $cm^2$-sec)")
+            ax1.set_xlabel("x (cm)")
+            lines.append(line)
         
-        # Insert new axis and plot net current if no analytical solution
-        if not show_AnalySol:
+        # Plot computed analytical solution
+        if show_AnalySol and sol_x == sol_y == []:
+            try:
+                line, = ax1.plot(self.mesh.xCenters, self.analytical_solution, label="Scalar Flux (Analytical)")
+                lines.append(line)
+            except AttributeError: # You forgot to define self.analytical_solution...
+                raise TransportError("Must either call analytical solution method or explicitly define sol_x and sol_y")
+        
+        # Plot provided analytical solution
+        elif show_AnalySol and sol_x != sol_y != []:
+            line, = ax1.plot(sol_x, sol_y, label="Scalar Flux (Analytical)")
+            lines.append(line)
+        
+        # Plot current on new axis
+        if show_current:
             ax2 = ax1.twinx()
             
-            line2, = ax2.plot(self.mesh.xCenters, self.mesh.netCurrent, color="red", label="Net Current")
+            line2, = ax2.plot(self.mesh.xEdgelocs, np.round(self.netCurrent_edges, decimals=5), color="red", label="Net Current")
             ax2.set_ylabel("J (particle per $cm^2$-sec)")
-            
-            lines = [line1, line2]
-            labels = [line.get_label() for line in lines]
-            ax1.legend(lines, labels)
-            plt.show()
-            
-            return
+            lines.append(line2)
         
-        # Analytical solution is calculated automatically, no current shown
-        elif show_AnalySol and sol_x == sol_y == []:
-            try:
-                ax1.plot(self.mesh.xCenters, self.analytical_solution, label="Exact Solution")
-            except ValueError: # You forgot to define self.analytical_solution...
-                raise TransportError("Must either call analytical solution method or explicitly define sol_x and sol_y")
-            
-            ax1.legend()
-            plt.show()
-        
-        # Analytical solution is provided explicitly, no current shown
-        elif show_AnalySol and sol_x != sol_y != []:
-            ax1.plot(sol_x, sol_y, label="Exact Solution")
-            ax1.legend()
-            plt.show()
+        # Show plot
+        labels = [line.get_label() for line in lines]
+        ax1.legend(lines, labels)
         
         return
+    
+###############################################
 
-############## Test Case ##############
+class TransportError(Exception):
+    """ Class for catching transport errors """
 
-if __name__ == "__main__":
+################ Test Cases ###################
+
+### Uniform infinite medium, source iteration
+def test1():
     
     r_width = 1
     num_regions = 1 # Don't change
-    num_cells = 20
+    num_cells = 10
     num_mus = 4
     
     sigma, sigma_s, source = 10, 0, 10
@@ -595,13 +705,43 @@ if __name__ == "__main__":
     
     infModel1 = Model(medium1, angfluxLBC = 0, angfluxRBC = 0)
     infModel1.combineMesh()
-    infModel1.doDiamondDiffV3(LOUD=True)
+    infModel1.doDiamondDiffV4(itermethod="SI", LOUD=False)
+    infModel1.solution_UIM()
+    infModel1.plotModel(show_AnalySol=True, show_current=True)
+    infModel1.plotOptics()
+    
+    return
+
+### Uniform infinite medium, Quasi-diffusion
+def test2():
+    
+    r_width = 1
+    num_regions = 1 # Don't change
+    num_cells = 3
+    num_mus = 4
+    
+    sigma, sigma_s, source = 10, 0, 10
+
+    medium1 = Region(r_width,sigma,sigma_s,source,"inf_medium","reflecting","reflecting")
+    medium1.applyMesh(num_cells, num_regions/num_cells*r_width, num_mus)
+    
+    infModel1 = Model(medium1, angfluxLBC = 0, angfluxRBC = 0)
+    infModel1.combineMesh()
+    infModel1.doDiamondDiffV4(itermethod="QD", LOUD=False)
     
     infModel1.plotModel(show_AnalySol=False)
     infModel1.plotOptics()
+    
+    return
 
-###############################################
+def main():
+    
+    test1()
+    print("Test 1 (UIM w/ SI) success!")
+    
+    test2()
+    print("Test 2 (UIM w/ QD) success!")
 
-class TransportError(Exception):
-    """ Class for catching transport errors """
+if __name__ == "__main__":
+    main()
 
