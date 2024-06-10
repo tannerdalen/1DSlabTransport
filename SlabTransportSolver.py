@@ -9,7 +9,6 @@
 
 from dataclasses import dataclass, field
 from typing import Any
-from collections import Counter
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
