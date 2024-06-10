@@ -1,4 +1,4 @@
-from SlabTransportSolver_QD import Region, Model
+from SlabTransportSolver import Region, Model
 import numpy as np
 
 ### General idea:
