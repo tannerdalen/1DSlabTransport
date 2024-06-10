@@ -517,15 +517,13 @@ class Model:
                 print(f"-=- Converged in {iterNum} iterations -=-")
                 
                 self.scalarfluxes_edges = phi_new_edges
+                self.angularfluxes_edges = angfluxes_combined_edges
                 self.netCurrent_edges = self._convertAng2NetCurrent(angfluxes_combined_edges)
             
             else:
                 
                 iterNum +=1
-                if itermethod == "SI":
-                    phi_old_edges = self._sourceIteration(phi_new_edges)
-                elif itermethod == "QD":
-                    phi_old_edges = self._quasiDiffusion(angfluxes_combined_edges)
+                phi_old_edges = phi_new_edges
                     
         return phi_new_edges
     
@@ -534,17 +532,17 @@ class Model:
             for all edges """
         
         r = self.regions[0]
-        self.analytical_solution = np.array([r.source/(r.sigma-r.sigma_s)]*len(self.mesh.cell_widths))
+        self.analytical_solution = np.array([r.source/(r.sigma-r.sigma_s)]*len(self.mesh.xEdgelocs))
         return self.analytical_solution
     
     def solution_SFPA(self) -> np.array:
         """ Calculates the source-free pure absorber
             soolution for all edges """
         
-        self.analytical_solution = np.zeros_like(self.mesh.angfluxes_edges)
+        self.analytical_solution = np.zeros_like(self.angularfluxes_edges)
         
         # Set leftmost incident flux
-        self.analytical_solution[0] = np.append(np.zeros_like(self.angfluxLBC), self.angfluxLBC, axis=0)
+        self.analytical_solution[0] = np.append(self.angfluxLBC, np.zeros_like(self.angfluxLBC), axis=0)
         
         for i in range(1,len(self.mesh.angfluxes_edges)):
             
@@ -552,8 +550,11 @@ class Model:
             dx = self.mesh.cell_widths[i-1]
             
             for m in range(len(self.mesh.mus)):
-                self.analytical_solution[i][m] = self.analytical_solution[i-1][m]*np.exp(sigma*dx/abs(self.mesh.mus[m]))
-            
+                self.analytical_solution[i][m] = self.analytical_solution[i-1][m]*np.exp(-sigma*dx/abs(self.mesh.mus[m]))
+        
+        # Convert to scalar flux
+        self.analytical_solution = self._convertAng2Scal(self.analytical_solution)
+        
         return self.analytical_solution
     
     def plotOptics(self) -> None:
@@ -658,7 +659,7 @@ class Model:
         # Plot computed analytical solution
         if show_AnalySol and sol_x == sol_y == []:
             try:
-                line, = ax1.plot(self.mesh.xCenters, self.analytical_solution, label="Scalar Flux (Analytical)")
+                line, = ax1.plot(self.mesh.xEdgelocs, self.analytical_solution, label="Scalar Flux (Analytical)")
                 lines.append(line)
             except AttributeError: # You forgot to define self.analytical_solution...
                 raise TransportError("Must either call analytical solution method or explicitly define sol_x and sol_y")
