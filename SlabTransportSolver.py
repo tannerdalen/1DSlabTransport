@@ -10,11 +10,42 @@
 from dataclasses import dataclass, field
 from typing import Any
 import itertools
+import inspect
+import time
+import tracemalloc
+import functools
 import numpy as np
 import matplotlib.pyplot as plt
 
 BOUNDARY_CONDITIONS = ["vacuum", "reflecting", None]
 ITERATION_METHODS = ["SI","QD"]
+
+##########################################
+
+def _getFuncName():
+    return inspect.currentframe().f_back.f_code.co_name
+
+def timer(func):
+    @functools.wraps(func)
+    def wrapper_timer(*args, **kwargs):
+        tic = time.perf_counter()
+        value = func(*args, **kwargs)
+        toc = time.perf_counter()
+        elapsed_time = toc - tic
+        print(f"{func.__name__} elapsed time: {elapsed_time:0.4f} seconds")
+        return value
+    return wrapper_timer
+
+def memoryusage(func):
+    @functools.wraps(func)
+    def wrapper_memory(*args, **kwargs):
+        tracemalloc.start()
+        value = func(*args, **kwargs)
+        memory = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        print(f"{func.__name__} used maximum memory : {memory[1]/1024:.4f} KB")
+        return value
+    return wrapper_memory
 
 ##########################################
 
@@ -36,7 +67,7 @@ class Mesh:
                          uniform width == cell_width
             2. List    - Each element of cell_widths defines the width
                          for the "ith" cell. An error is thrown if
-                         len(cel_widths) != cellbins.
+                         len(cell_widths) != cellbins.
                          
         "angdegree" is used to define the angular quadrature in each cell.
         Must be an even integer.
@@ -55,7 +86,7 @@ class Mesh:
         else:
             self.cell_widths = cell_widths
         
-        # Create separate array for edges of a given cell
+        # Initialize arrays for edges of a given cell
         self.scalarfluxes_edges = np.zeros([self.cellbins+1])
         self.angfluxes_edges = np.zeros([self.cellbins+1, self.angbins])
         
@@ -116,10 +147,15 @@ class Region:
         if not self.LBC in BOUNDARY_CONDITIONS or not self.RBC in BOUNDARY_CONDITIONS:
             raise TransportError(f"Invalid boundary conditions: {self.LBC},{self.RBC}")
             
-    def applyMesh(self, cellbins=1, cell_widths=1, angdegree=2) -> None:
-        """ Binds a Mesh onto a Region """
+    def applyMesh(self, cellbins=1, cell_widths=1, angdegree=2, mesh_obj=None) -> None:
+        """ Binds a Mesh onto a Region. If a mesh object
+            is provided, that object overrides any of the
+            other kwargs """
         
-        self.mesh = Mesh(cellbins, cell_widths, angdegree)
+        if mesh_obj:
+            self.mesh = mesh_obj
+        else:
+            self.mesh = Mesh(cellbins, cell_widths, angdegree)
         
         # Mesh must span the entire Region
         if not self.width == self.mesh.xEdgelocs_right[-1]:
@@ -141,7 +177,7 @@ class Model:
         self._setAbsoluteLocations()
         self.angfluxLBC = angfluxLBC
         self.angfluxRBC = angfluxRBC
-        self.mesh = None
+        self._combineMesh()
         
         # Checks
         if len(set([r.label for r in regions])) != len([r.label for r in regions]):
@@ -168,34 +204,23 @@ class Model:
         
         return
     
-    def getMaterialProperties(self, x: float) -> tuple:
-        """ 
-        Gets material properties of some region 
-        at location 'x' 
-            
-        Args:
-            x - location within model
-        Returns:
-            sigma_s, sigma_t, source at location 'x' 
-        """
-        for r in self.regions:
-            if r.ALB <= x <= r.ARB:  
-                return r.sigma_s, r.sigma, r.source
-    
     def _convertBC(self, BC: float) -> np.array:
         """ Converts non-array boundary condition (BC) to np.array. 
             Assumes all incident flux[m] == BC. """
         return np.array([BC]*self.mesh.angbins)
     
-    def combineMesh(self) -> None:
+    def _combineMesh(self) -> None:
         """ Combines each Region Mesh into
             one large Mesh object """
         
         # Checks
         for r in self.regions:
-            if not r.mesh.angdegree == self.regions[0].mesh.angdegree:
-                raise TransportError("Region Mesh objects must have same angle degree but have degrees: " + 
-                                     str([r.mesh.angdegree for r in self.regions]))
+            try:
+                if not r.mesh.angdegree == self.regions[0].mesh.angdegree:
+                    raise TransportError("Region Mesh objects must have same angle degree but have degrees: " + 
+                                         str([r.mesh.angdegree for r in self.regions]))
+            except AttributeError:
+                raise TransportError("Unable to region meshes. Were they ever defined?")
         
         cellbins_tot = sum(r.mesh.cellbins for r in self.regions)
         cell_widths_tot = list(itertools.chain(*[r.mesh.cell_widths for r in self.regions])) # [1,2],[3],[4,5,6] -> [1,2,3,4,5,6]
@@ -289,89 +314,94 @@ class Model:
         
         ### Setup matrix...
         
-        ### Leftmost boundary...    
-        sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[0])
-        sigma_a = sigma - sigma_s
-        dx = self.mesh.cell_widths[0]
-        
-        # "E_12" or E_32" represents "E_1/2" and "E_3/2"
-        E_12 = Efactor(angfluxes_combined_edges[0])
-        E_32 = Efactor(angfluxes_combined_edges[1])
-        B_12 = Bfactor(angfluxes_combined_edges[0])
-        # E_12 = 1/3
-        # E_32 = 1/3
-        # B_12 = 1/2
-        
-        if self.regions[0].LBC == "reflecting":
-            A[0][0] = E_12/(sigma*dx) + sigma_a*dx/2 # phi_1/2
-            A[0][1] = -E_32/(sigma*dx) # phi_3/2
-            b[0] = source*dx/2
+        for i in range(len(angfluxes_combined_edges)):
             
-        elif self.regions[0].LBC == "vacuum":
-            A[0][0] = B_12 + E_12/(sigma*dx) + sigma_a*dx/2 # phi_1/2
-            A[0][1] = -E_32/(sigma*dx) # phi_3/2
-            b[0] = source*dx/2 + 2*sum([self.mesh.mus[m]*angfluxes_combined_edges[0][m]*self.mesh.wgts[m] \
-                                        for m in range((len(self.mesh.mus))) if self.mesh.mus[m] > 0])
-    
-        A_eddingtons[0][0] = E_12
-        A_eddingtons[0][1] = E_32
-        A_eddingtons[0][2] = 0
+            ### Leftmost boundary...    
+            if i == 0:
+                
+                sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[0])
+                sigma_a = sigma - sigma_s
+                dx = self.mesh.cell_widths[0]
+                
+                # "E_12" or E_32" represents "E_1/2" and "E_3/2"
+                E_12 = Efactor(angfluxes_combined_edges[0])
+                E_32 = Efactor(angfluxes_combined_edges[1])
+                B_12 = Bfactor(angfluxes_combined_edges[0])
+                # E_12 = 1/3
+                # E_32 = 1/3
+                # B_12 = 1/2
+                
+                if self.regions[0].LBC == "reflecting":
+                    A[0][0] = E_12/(sigma*dx) + sigma_a*dx/2 # phi_1/2
+                    A[0][1] = -E_32/(sigma*dx) # phi_3/2
+                    b[0] = source*dx/2
+                    
+                elif self.regions[0].LBC == "vacuum":
+                    A[0][0] = B_12 + E_12/(sigma*dx) + sigma_a*dx/2 # phi_1/2
+                    A[0][1] = -E_32/(sigma*dx) # phi_3/2
+                    b[0] = source*dx/2 + 2*sum([self.mesh.mus[m]*angfluxes_combined_edges[0][m]*self.mesh.wgts[m] \
+                                                for m in range((len(self.mesh.mus))) if self.mesh.mus[m] > 0])
+            
+                A_eddingtons[0][0] = E_12
+                A_eddingtons[0][1] = E_32
+                A_eddingtons[0][2] = 0
         
-        ### Rightmost boundary...   
-        sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[-1])
-        sigma_a = sigma - sigma_s
-        dx = self.mesh.cell_widths[-1]
-        
-        E_Jminhalf = Efactor(angfluxes_combined_edges[-2])
-        E_Jplushalf = Efactor(angfluxes_combined_edges[-1])
-        B_Jplushalf = Bfactor(angfluxes_combined_edges[-1])
-        # E_Jminhalf = 1/3
-        # E_Jplushalf = 1/3
-        # B_Jplushalf = 1/2
-        
-        if self.regions[-1].RBC == "reflecting":
-            A[-1][-2] = -E_Jminhalf/(sigma*dx) # phi_J-1/2
-            A[-1][-1] = E_Jplushalf/(sigma*dx) + sigma_a*dx/2 # phi_J+1/2
-            b[-1] = source*dx/2
+            ### Rightmost boundary...
+            if i == len(angfluxes_combined_edges)-1:
+                sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[-1])
+                sigma_a = sigma - sigma_s
+                dx = self.mesh.cell_widths[-1]
+                
+                E_Jminhalf = Efactor(angfluxes_combined_edges[-2])
+                E_Jplushalf = Efactor(angfluxes_combined_edges[-1])
+                B_Jplushalf = Bfactor(angfluxes_combined_edges[-1])
+                # E_Jminhalf = 1/3
+                # E_Jplushalf = 1/3
+                # B_Jplushalf = 1/2
+                
+                if self.regions[-1].RBC == "reflecting":
+                    A[-1][-2] = -E_Jminhalf/(sigma*dx) # phi_J-1/2
+                    A[-1][-1] = E_Jplushalf/(sigma*dx) + sigma_a*dx/2 # phi_J+1/2
+                    b[-1] = source*dx/2
+                    
+                elif self.regions[-1].RBC == "vacuum":
+                    A[-1][-2] = -E_Jminhalf/(sigma*dx) # phi_J-1/2
+                    A[-1][-1] = B_Jplushalf + E_Jplushalf/(sigma*dx) + sigma_a*dx/2 
+                    b[-1] = source*dx/2 + 2*sum([abs(self.mesh.mus[m])*angfluxes_combined_edges[-1][m]*self.mesh.wgts[m] \
+                                                 for m in range(len(self.mesh.mus)) if self.mesh.mus[m] < 0])
+                
+                A_eddingtons[-1][-3] = 0
+                A_eddingtons[-1][-2] = E_Jminhalf
+                A_eddingtons[-1][-1] = E_Jplushalf
             
-        elif self.regions[-1].RBC == "vacuum":
-            A[-1][-2] = -E_Jminhalf/(sigma*dx) # phi_J-1/2
-            A[-1][-1] = B_Jplushalf + E_Jplushalf/(sigma*dx) + sigma_a*dx/2 
-            b[-1] = source*dx/2 + 2*sum([abs(self.mesh.mus[m])*angfluxes_combined_edges[-1][m]*self.mesh.wgts[m] \
-                                         for m in range(len(self.mesh.mus)) if self.mesh.mus[m] < 0])
-        
-        A_eddingtons[-1][-3] = 0
-        A_eddingtons[-1][-2] = E_Jminhalf
-        A_eddingtons[-1][-1] = E_Jplushalf
-        
-        ### Everything else in between...
-        for i in range(1,len(angfluxes_combined_edges)-1):
-            
-            # jth cell properties
-            sigma_si, sigma_i, source_i = self.getMaterialProperties(self.mesh.xCenters[i-1])
-            sigma_ai = sigma_i - sigma_si
-            dx_i = self.mesh.cell_widths[i-1]
-            
-            # jth + 1 cell properties
-            sigma_siplus, sigma_iplus, source_iplus = self.getMaterialProperties(self.mesh.xCenters[i])
-            sigma_aiplus = sigma_iplus - sigma_siplus
-            dx_iplus = self.mesh.cell_widths[i]
-            
-            E_Jminhalf = Efactor(angfluxes_combined_edges[i-1])
-            E_Jplushalf = Efactor(angfluxes_combined_edges[i])
-            E_Jplusthreehalf = Efactor(angfluxes_combined_edges[i+1])
-            # E_Jminhalf = 1/3
-            # E_Jplushalf = 1/3
-            # E_Jplusthreehalf = 1/3
-            
-            A[i][i-1] = -E_Jminhalf/(sigma_i*dx_i)
-            A[i][i+1] = -E_Jplusthreehalf/(sigma_iplus*dx_iplus)
-            A[i][i] = E_Jplushalf/(sigma_iplus*dx_iplus) + E_Jplushalf/(sigma_i*dx_i) + (sigma_ai*dx_i + sigma_aiplus*dx_iplus)/2
-            b[i] = (source_i*dx_i + source_iplus*dx_iplus)/2
-            
-            A_eddingtons[i][-1] = E_Jminhalf
-            A_eddingtons[i][1] = E_Jplusthreehalf
-            A_eddingtons[i][0] = E_Jplushalf
+            ### Everything else in between...
+            else:
+                
+                # jth cell properties
+                sigma_si, sigma_i, source_i = self.getMaterialProperties(self.mesh.xCenters[i-1])
+                sigma_ai = sigma_i - sigma_si
+                dx_i = self.mesh.cell_widths[i-1]
+                
+                # jth + 1 cell properties
+                sigma_siplus, sigma_iplus, source_iplus = self.getMaterialProperties(self.mesh.xCenters[i])
+                sigma_aiplus = sigma_iplus - sigma_siplus
+                dx_iplus = self.mesh.cell_widths[i]
+                
+                E_Jminhalf = Efactor(angfluxes_combined_edges[i-1])
+                E_Jplushalf = Efactor(angfluxes_combined_edges[i])
+                E_Jplusthreehalf = Efactor(angfluxes_combined_edges[i+1])
+                # E_Jminhalf = 1/3
+                # E_Jplushalf = 1/3
+                # E_Jplusthreehalf = 1/3
+                
+                A[i][i-1] = -E_Jminhalf/(sigma_i*dx_i)
+                A[i][i+1] = -E_Jplusthreehalf/(sigma_iplus*dx_iplus)
+                A[i][i] = E_Jplushalf/(sigma_iplus*dx_iplus) + E_Jplushalf/(sigma_i*dx_i) + (sigma_ai*dx_i + sigma_aiplus*dx_iplus)/2
+                b[i] = (source_i*dx_i + source_iplus*dx_iplus)/2
+                
+                A_eddingtons[i][-1] = E_Jminhalf
+                A_eddingtons[i][1] = E_Jplusthreehalf
+                A_eddingtons[i][0] = E_Jplushalf
                 
         # print(f"{A=} \n{b=}")
         # print(f"{A_eddingtons = }")
@@ -388,7 +418,23 @@ class Model:
         
         return phi_new_edges
     
-    def doDiamondDiffV4(self, eps=1e-6, itermax=10_000, itermethod="SI", LOUD=False) -> np.array:
+    def getMaterialProperties(self, x: float) -> tuple:
+        """ 
+        Gets material properties of some region 
+        at location 'x' 
+            
+        Args:
+            x - location within model
+        Returns:
+            sigma_s, sigma_t, source at location 'x' 
+        """
+        for r in self.regions:
+            if r.ALB <= x <= r.ARB:  
+                return r.sigma_s, r.sigma, r.source
+    
+    @timer
+    @memoryusage
+    def doTransport(self, eps=1e-6, itermax=10_000, itermethod="SI", LOUD=False) -> np.array:
         """ 
         Args:
             eps - Allowable error between iterations
@@ -414,11 +460,12 @@ class Model:
         # Grab only the positive mus
         mus, _ = self.mesh.getPositiveOrdinates()
         
-        # Set convergence properties
+        # Initialize convergence properties
         iterNum = 1
         max_diff = np.inf
         max_diffs = []
         all_diffs = []
+        spectral_radii = []
         isConverged = False
         
         # Begin loop
@@ -504,13 +551,19 @@ class Model:
             elif itermethod == "QD":
                 phi_new_edges = self._quasiDiffusion(angfluxes_combined_edges)
             
-            # Check if maximum difference between iterations is within
-            # convergence criteria
+            # Collect diagnostic data, including difference
+            # between current and last iteration
             diff = np.abs(phi_new_edges - phi_old_edges)
             all_diffs.append(diff)
             max_diff = np.max(diff)
             max_diffs.append(max_diff)
             
+            if iterNum >= 3:
+                spectral_radius = (max_diffs[iterNum-1]-max_diffs[iterNum-2]) / \
+                                  (max_diffs[iterNum-2]-max_diffs[iterNum-3])
+                spectral_radii.append(spectral_radius)
+            
+            # Check for convergence
             if max_diff <= eps:
                 
                 isConverged = True
@@ -519,6 +572,10 @@ class Model:
                 self.scalarfluxes_edges = phi_new_edges
                 self.angularfluxes_edges = angfluxes_combined_edges
                 self.netCurrent_edges = self._convertAng2NetCurrent(angfluxes_combined_edges)
+                
+                # Diagnostic information
+                self.max_diffs = max_diffs
+                self.spectral_radii = spectral_radii
             
             else:
                 
@@ -556,6 +613,35 @@ class Model:
         self.analytical_solution = self._convertAng2Scal(self.analytical_solution)
         
         return self.analytical_solution
+    
+    def plotIterations(self) -> None:
+        """ Plots maximum difference between iterations """
+        
+        plt.figure()
+        plt.plot(range(1,len(self.max_diffs)+1), self.max_diffs)
+        plt.xlabel("Iteration Number")
+        plt.ylabel("Maximum Difference Between Iterations")
+        plt.yscale("log")
+        plt.grid(True)
+        plt.show()
+        
+        return
+    
+    def plotSpectralRadius(self) -> None:
+        """ Plots spectral radius vs. iteration number """
+        
+        if not self.spectral_radii:
+            raise TransportError("Cannot plot spectral radii, too few iterations.")
+        
+        plt.figure()
+        plt.plot(range(2,len(self.spectral_radii)+2), self.spectral_radii)
+        plt.xlabel("Iteration Number")
+        plt.ylabel("Est. Spectral Radius")
+        plt.yscale("linear")
+        plt.grid(True)
+        plt.show()
+        
+        return
     
     def plotOptics(self) -> None:
         """ Plots max optical thickness in each cell of the model """
@@ -651,7 +737,7 @@ class Model:
             
         # Plot numerical solution
         if show_NumericalSol:
-            line, = ax1.plot(self.mesh.xEdgelocs, np.round(self.scalarfluxes_edges, decimals=5), label="Scalar Flux (Numerical)")
+            line, = ax1.plot(self.mesh.xEdgelocs, np.round(self.scalarfluxes_edges, decimals=3), label="Scalar Flux (Numerical)")
             ax1.set_ylabel("ϕ (particle per $cm^2$-sec)")
             ax1.set_xlabel("x (cm)")
             lines.append(line)
@@ -704,8 +790,7 @@ def test1():
     medium1.applyMesh(num_cells, num_regions/num_cells*r_width, num_mus)
     
     infModel1 = Model(medium1, angfluxLBC = 0, angfluxRBC = 0)
-    infModel1.combineMesh()
-    infModel1.doDiamondDiffV4(itermethod="SI", LOUD=False)
+    infModel1.doTransport(itermethod="SI", LOUD=False)
     infModel1.solution_UIM()
     infModel1.plotModel(show_AnalySol=True, show_current=True)
     infModel1.plotOptics()
@@ -726,8 +811,7 @@ def test2():
     medium1.applyMesh(num_cells, num_regions/num_cells*r_width, num_mus)
     
     infModel1 = Model(medium1, angfluxLBC = 0, angfluxRBC = 0)
-    infModel1.combineMesh()
-    infModel1.doDiamondDiffV4(itermethod="QD", LOUD=False)
+    infModel1.doTransport(itermethod="QD", LOUD=False)
     
     infModel1.plotModel(show_AnalySol=False)
     infModel1.plotOptics()

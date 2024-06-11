@@ -10,22 +10,31 @@ import numpy as np
 
 def UniformInfiniteMedium():
     
-    width = 5
-    sigma_t = 10
-    sigma_s = 8
-    source  = 10
-    num_cells = 400
-    num_angs = 4
+    width = 1
+    sigma_t = 1
+    sigma_s = 0.8
+    source  = 1
+    num_cells = 100
+    num_angs = 8
     
     r = Region(width, sigma_t, sigma_s, source, "inf_medium", "reflecting", "reflecting")
     r.applyMesh(num_cells, width/num_cells, num_angs)
     
-    model = Model(r)#, angfluxRBC=2.55)
-    model.combineMesh()
-    _ = model.doDiamondDiffV4(itermethod="QD", LOUD=False)
+    model = Model(r)
+    
+    # Source Iteration
+    _ = model.doTransport(itermethod="SI", LOUD=False)
     model.solution_UIM()
-    model.plotModel(show_AnalySol=True, show_current=True)
-    # model.plotOptics()
+    model.plotModel(show_AnalySol=True)
+    model.plotSpectralRadius()
+    model.plotIterations()
+    
+    # Quasi-Diffusion
+    _ = model.doTransport(itermethod="QD", LOUD=False)
+    model.solution_UIM()
+    model.plotModel(show_AnalySol=True)
+    model.plotSpectralRadius()
+    model.plotIterations()
     
     return 
 
@@ -47,8 +56,8 @@ def TwoRegionReflecting():
     r2.applyMesh(num_cells, width/num_cells, num_angs)
     
     model = Model(r1,r2)#, angfluxLBC=10, angfluxRBC=12)
-    model.combineMesh()
-    _ = model.doDiamondDiffV4(itermethod="QD",LOUD=False)
+    
+    _ = model.doTransport(itermethod="QD",LOUD=False)
     # model.solution_UIM()
     model.plotModel(show_AnalySol=False, show_current=True) # Shows current
     # model.plotOptics()
@@ -57,10 +66,52 @@ def TwoRegionReflecting():
 
 # TwoRegionReflecting()
 
+def ApplicationProblem():
+    
+    r1 = Region(1, 1, 0, 1, "1", "vacuum", "vacuum")
+    r2 = Region(1, 1, 0.1, 1, "2", "vacuum", "vacuum")
+    r3 = Region(1, 1, 0.2, 10, "3", "vacuum", "vacuum")
+    r4 = Region(1, 1, 0.3, 1, "4", "vacuum", "vacuum")
+    r5 = Region(1, 1, 0.4, 1, "5", "vacuum", "vacuum")
+    r6 = Region(1, 1, 0.5, 1, "6", "vacuum", "vacuum")
+    r7 = Region(1, 1, 0.6, 1, "7", "vacuum", "vacuum")
+    r8 = Region(1, 1, 0.7, 1, "8", "vacuum", "vacuum")
+    r9 = Region(1, 1, 0.8, 1, "9", "vacuum", "vacuum")
+    r10 = Region(1, 1, 0.999, 1, "10", "vacuum", "vacuum")
+    
+    cells_per_region = 100
+    width = 1/cells_per_region
+    angdegree = 8
+    
+    r1.applyMesh(cells_per_region, width, angdegree)
+    r2.applyMesh(cells_per_region, width, angdegree)
+    r3.applyMesh(cells_per_region, width, angdegree)
+    r4.applyMesh(cells_per_region, width, angdegree)
+    r5.applyMesh(cells_per_region, width, angdegree)
+    r6.applyMesh(cells_per_region, width, angdegree)
+    r7.applyMesh(cells_per_region, width, angdegree)
+    r8.applyMesh(cells_per_region, width, angdegree)
+    r9.applyMesh(cells_per_region, width, angdegree)
+    r10.applyMesh(cells_per_region, width, angdegree)
+    
+    model = Model(r1,r2,r3,r4,r5,r6,r7,r8,r9,r10)
+    
+    _ = model.doTransport(itermethod="QD")
+    
+    model.plotModel(show_current=False)
+    model.plotSpectralRadius()
+    model.plotIterations()
+    
+    print(f"Est. spectral radius = {model.spectral_radii[-1]}")
+    
+    return
+
+# ApplicationProblem()
+
 def SrcFreePureAbsorber():
     
     width = 1
-    sigma_t = 10
+    sigma_t = 5
     sigma_s = 0
     source  = 0
     num_cells = 100
@@ -70,10 +121,10 @@ def SrcFreePureAbsorber():
     r.applyMesh(num_cells, width/num_cells, angdegs)
     
     model = Model(r, angfluxLBC=10, angfluxRBC=0)
-    model.combineMesh()
-    _ = model.doDiamondDiffV4(itermethod="SI",LOUD=False)
-    # model.solution_SFPA()
-    model.plotModel(show_AnalySol=False) # Shows current
+    
+    _ = model.doTransport(itermethod="QD",LOUD=False)
+    model.solution_SFPA()
+    model.plotModel(show_AnalySol=True) # Shows current
     # model.plotModel(show_AnalySol=True)  # Doesn't show current
     # model.plotOptics()
     
@@ -93,8 +144,8 @@ def SrcFreeHalfSpace():
     r2.applyMesh(int(12/20*num_cells), 20/num_cells, angdeg)
     
     model = Model(r1,r2, angfluxLBC=10, angfluxRBC=8)
-    model.combineMesh()
-    _ = model.doDiamondDiffV4(itermethod="SI",LOUD=False)
+    
+    _ = model.doTransport(itermethod="QD",LOUD=False)
     # model.plotModel(show_AnalySol=False)
     # model.plotOptics()
     
@@ -202,9 +253,11 @@ def Problem1(num_cells):
     r1.applyMesh(num_cells, 10/num_cells, 4)
     
     model = Model(r1, angfluxLBC=np.array([0,10]))
-    model.combineMesh()
-    _ = model.doDiamondDiffV4(itermethod="QD", LOUD=False)
+    
+    scalarfluxes = model.doTransport(itermethod="QD", LOUD=False)
+    # print(scalarfluxes[:10])
     model.plotModel()
+    model.plotIterations()
     # model.plotOptics()
     
     return 
@@ -216,12 +269,12 @@ def ReedsProblemUniform():
     
     r1_width, r1_sigma = 2, 1
     r2_width, r2_sigma = 2, 1
-    r3_width, r3_sigma = 1, 0.001
+    r3_width, r3_sigma = 1, 0
     r4_width, r4_sigma = 1, 5
     r5_width, r5_sigma = 2, 50
     tot_width = 8
     
-    num_cells = 800
+    num_cells = 400
     angdeg = 8
     
     r1 = Region(r1_width,r1_sigma,0.9,0,"ScatNoSrc","vacuum","vacuum")
@@ -237,13 +290,13 @@ def ReedsProblemUniform():
     r5.applyMesh(int(r5_width/tot_width*num_cells), tot_width/num_cells, angdeg)
     
     model = Model(r1,r2,r3,r4,r5, angfluxLBC=0, angfluxRBC=0)
-    model.combineMesh()
-    _ = model.doDiamondDiffV4(itermethod="QD",LOUD=False)
-    model.plotModel()
+    
+    _ = model.doTransport(itermethod="QD",LOUD=False)
+    model.plotModel(show_current=True)
     # model.plotOptics()
     
     return 
 
 # ReedsProblemUniform()
-    
+
     
