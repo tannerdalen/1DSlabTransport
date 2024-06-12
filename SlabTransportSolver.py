@@ -558,9 +558,10 @@ class Model:
             max_diff = np.max(diff)
             max_diffs.append(max_diff)
             
-            if iterNum >= 3:
-                spectral_radius = (max_diffs[iterNum-1]-max_diffs[iterNum-2]) / \
-                                  (max_diffs[iterNum-2]-max_diffs[iterNum-3])
+            if iterNum >= 2:
+                # spectral_radius = (max_diffs[iterNum-1]-max_diffs[iterNum-2]) / \
+                #                   (max_diffs[iterNum-2]-max_diffs[iterNum-3])
+                spectral_radius = max_diffs[iterNum-1]/max_diffs[iterNum-2]
                 spectral_radii.append(spectral_radius)
             
             # Check for convergence
