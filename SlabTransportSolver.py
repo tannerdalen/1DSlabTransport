@@ -22,9 +22,6 @@ ITERATION_METHODS = ["SI","QD"]
 
 ##########################################
 
-def _getFuncName():
-    return inspect.currentframe().f_back.f_code.co_name
-
 def timer(func):
     @functools.wraps(func)
     def wrapper_timer(*args, **kwargs):
