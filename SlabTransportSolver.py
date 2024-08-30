@@ -1,16 +1,31 @@
-### Tanner Heatherly
-### NSE 654 - Computational Particle Transport
-### June 13th, 2024
-### Final Project
- #
-### Descritization method: Diamond Difference
- #
-### Final Project addition: Quasi-Diffusion
+"""
+This is a radiation transport code built in Python by Tanner Heatherly.
+See GitHub for latest version number and changes.
+
+Geometry:
+    - Slab
+
+Spatial Discretization:
+    - Diamond Difference
+    
+Angular Discretization:
+    - Discrete Ordinates (Sn)
+
+Iteration Methods:
+    - Source Iteraton
+    - Quasi-Diffusion
+    
+TO BE COMPLETED:
+    - Add fission term
+    - Move to Multi-group
+    - Add alpha and k-eigenvalue solutions
+    - Time-dependence
+    - 2D?
+"""
 
 from dataclasses import dataclass, field
 from typing import Any
 import itertools
-import inspect
 import time
 import tracemalloc
 import functools
@@ -21,9 +36,6 @@ BOUNDARY_CONDITIONS = ["vacuum", "reflecting", None]
 ITERATION_METHODS = ["SI","QD"]
 
 ##########################################
-
-def _getFuncName():
-    return inspect.currentframe().f_back.f_code.co_name
 
 def timer(func):
     @functools.wraps(func)
@@ -53,7 +65,7 @@ class Mesh:
     
     """ Mesh to lay onto a Region. """
     
-    def __init__(self, cellbins=1, cell_widths=1, angdegree=2) -> None:
+    def __init__(self, cellbins: int = 1, cell_widths=1, angdegree: int = 2) -> None:
         """  
         The methodology goes like this...
         
@@ -134,6 +146,7 @@ class Region:
     width: float = field(default=0)    # Region thickness
     sigma: float = field(default=0)    # Total cross section
     sigma_s: float = field(default=0)  # Scattering cross section
+    sigma_f: float = field(default=0)  # Fission cross section
     source : float = field(default=0)  # Source "S"
     label: str = field(default="r1")   # Region name
     LBC: Any = field(default=None)     # Left boundary condition
@@ -147,7 +160,7 @@ class Region:
         if not self.LBC in BOUNDARY_CONDITIONS or not self.RBC in BOUNDARY_CONDITIONS:
             raise TransportError(f"Invalid boundary conditions: {self.LBC},{self.RBC}")
             
-    def applyMesh(self, cellbins=1, cell_widths=1, angdegree=2, mesh_obj=None) -> None:
+    def applyMesh(self, cellbins: int = 1, cell_widths=1, angdegree: int = 2, mesh_obj=None) -> None:
         """ Binds a Mesh onto a Region. If a mesh object
             is provided, that object overrides any of the
             other kwargs """
@@ -319,7 +332,7 @@ class Model:
             ### Leftmost boundary...    
             if i == 0:
                 
-                sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[0])
+                sigma, sigma_s, sigma_f, source = self.getMaterialProperties(self.mesh.xCenters[0])
                 sigma_a = sigma - sigma_s
                 dx = self.mesh.cell_widths[0]
                 
@@ -348,7 +361,7 @@ class Model:
         
             ### Rightmost boundary...
             if i == len(angfluxes_combined_edges)-1:
-                sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[-1])
+                sigma, sigma_s, sigma_f, source = self.getMaterialProperties(self.mesh.xCenters[-1])
                 sigma_a = sigma - sigma_s
                 dx = self.mesh.cell_widths[-1]
                 
@@ -378,12 +391,12 @@ class Model:
             else:
                 
                 # jth cell properties
-                sigma_si, sigma_i, source_i = self.getMaterialProperties(self.mesh.xCenters[i-1])
+                sigma_i, sigma_si, sigma_sf, source_i = self.getMaterialProperties(self.mesh.xCenters[i-1])
                 sigma_ai = sigma_i - sigma_si
                 dx_i = self.mesh.cell_widths[i-1]
                 
                 # jth + 1 cell properties
-                sigma_siplus, sigma_iplus, source_iplus = self.getMaterialProperties(self.mesh.xCenters[i])
+                sigma_iplus, sigma_siplus, sigma_fiplus, source_iplus = self.getMaterialProperties(self.mesh.xCenters[i])
                 sigma_aiplus = sigma_iplus - sigma_siplus
                 dx_iplus = self.mesh.cell_widths[i]
                 
@@ -430,7 +443,7 @@ class Model:
         """
         for r in self.regions:
             if r.ALB <= x <= r.ARB:  
-                return r.sigma_s, r.sigma, r.source
+                return r.sigma, r.sigma_s, r.sigma_f, r.source
     
     @timer
     @memoryusage
@@ -504,7 +517,7 @@ class Model:
             for i in range(1,len(angfluxes_rightward_edges)):
                 
                 # Get model properties
-                sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[i-1])
+                sigma, sigma_s, sigma_f, source = self.getMaterialProperties(self.mesh.xCenters[i-1])
                 dx = self.mesh.cell_widths[i-1]
                 
                 for m in range(len(mus)):
@@ -524,7 +537,7 @@ class Model:
             for i in range(len(angfluxes_leftward_edges) - 2, -1, -1):
                 
                 # Get model properties
-                sigma_s, sigma, source = self.getMaterialProperties(self.mesh.xCenters[i])
+                sigma, sigma_s, sigma_f, source = self.getMaterialProperties(self.mesh.xCenters[i])
                 dx = self.mesh.cell_widths[i]
                 
                 for m in range(len(mus)):
@@ -604,7 +617,7 @@ class Model:
         
         for i in range(1,len(self.mesh.angfluxes_edges)):
             
-            _, sigma, _ = self.getMaterialProperties(self.mesh.xCenters[i-1])
+            sigma, _, _, _ = self.getMaterialProperties(self.mesh.xCenters[i-1])
             dx = self.mesh.cell_widths[i-1]
             
             for m in range(len(self.mesh.mus)):
@@ -685,7 +698,7 @@ class Model:
         # Get the max optical thicknesses of each cell
         maxOptThicknesses = np.zeros_like(self.mesh.xCenters)
         for i, x in enumerate(self.mesh.xCenters):
-            _, sigma, _ = self.getMaterialProperties(x)
+            sigma, _, _, _ = self.getMaterialProperties(x)
             dx = self.mesh.cell_widths[i]
             maxOptThicknesses[i] = sigma*dx/min(np.abs(self.mesh.mus))
         
